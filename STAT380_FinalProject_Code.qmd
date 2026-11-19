@@ -16,13 +16,17 @@ self-contained: true
 Put whatever libraries you use here.
 
 ```{r}
-
+library(tidyverse)
+library(ggplot2)
+library(tidymodels)
+library(rpart)
+library(rpart.plot)
 ```
 
 Load the data here
 
 ```{r}
-
+gapminder <- read_csv("gapminder_final_F26.csv")
 ```
 
 ## Exploratory data analysis(EDA) part 1
@@ -32,14 +36,45 @@ For this section: Check for variables with missing data, units of variables, and
 ### Checking for missing data
 
 Check all variables for missing data. Which variables should you think about removing before modeling if missing data will cause problems? Do not remove them now, but do list them.
+From checking for missing data, we think that Democracy, Energy Use Per Person, Cell Phones, and Natural Disaster Deaths variables should be removed before modeling.
+
+```{r}
+na_summary <- gapminder %>%
+  summarise(across(everything(), ~ sum(is.na(.))))
+na_summary
+```
 
 ### Units of variables
 
 Looking at the variables are there any where the units are not controlled for population? Fix that now. Any other concerns about units of measurement?
+The only variable that is not controlled for population is natural disaster deaths. There are some variables that are based on the entire population like GDP and other variables that are based on 100k people. However, this shouldn't be an issue as the metrics are population-adjusted.
+
+```{r}
+gapminder <- gapminder |>
+  mutate(
+    natural_disaster_deaths_per_100k = (natural_disaster_deaths / population) * 100000
+  ) |>
+  select(-natural_disaster_deaths)
+```
 
 ### Logging variables
 
 Which variables have you logged in the past? Which variables do you think you should log here additionally? This space is for graphing and then logging the variables in the data. Make sure to drop the unlogged values now so you do not accidently include both the logged and the unlogged value in the model.
+
+Excluding variables that are being marked as removed due to missing data, we previously logged population. In addition to population, we should also log gdp, daily income, health spending per person, energy use per person, and natural disaster deaths per 100k.
+
+
+```{r}
+gapminder <- gapminder |>
+  mutate(
+    log_gdp = log(gdp),
+    log_population = log(population),
+    log_daily_income = log(daily_income),
+    log_health_spending = log(health_spending_per_person),
+    log_natural_disaster_deaths_per_100k = log(natural_disaster_deaths_per_100k)
+  ) |>
+  select(-gdp, -population, -daily_income, -health_spending_per_person, -natural_disaster_deaths_per_100k)
+```
 
 ### More EDA (optional)
 
