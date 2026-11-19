@@ -1,8 +1,7 @@
 ---
-title: "Final Project Template"
-author: "Team member names here."
-format: html
-self-contained: true
+title: "STAT 380 Final Project"
+author: "Ashley Song, Ian Peralta, Bryan Xiao"
+format: pdf
 editor: visual
 ---
 
@@ -11,10 +10,6 @@ Feel free to change render format to html using
 format: html
 
 self-contained: true
-
-## Instructions
-
-This is the template document for the final project. You must use the template document for your code, since it will make it much easier to follow.
 
 ## Libraries and data load
 
