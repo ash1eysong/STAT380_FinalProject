@@ -144,41 +144,275 @@ State which method you are using.
 
 State which categorical variable you will use as a hold out.
 
+We're using k-means on the scaled quantitative variables since it gives every country exactly one cluster number which makes it easy to compare against a category afterward, and the hold out variable is `world_4region`, which we keep out of the clustering completely so we can check the clusters against it at the end.
+
 ### Missing values drop
 
 Should you be dropping missing values for your technique? If so are there variables you should drop before dropping rows with missing values? Put the code and explanation here.
+
+k-means and PCA can't use a row with an NA so every country needs a value for every variable we cluster on. The file has 273 rows but 79 of them are blank territories with no name, so we start with the 194 real countries. From there we drop the four variables we already flagged in the missing data section, which are `democracy`, `energy_use_per_person`, `cell_phones` and the logged natural disaster deaths, and we also drop `happiness` since it's missing for 58 countries which is more than `cell_phones` at 48. After that we drop any country that still has an NA, which leaves 129 of the 194.
+
+```{r}
+#| label: cluster-data
+
+# only the real countries, the other rows have no name
+cluster_data <- gapminder |>
+  filter(!is.na(name)) |>
+  select(-democracy, -energy_use_per_person, -cell_phones,
+         -log_natural_disaster_deaths_per_100k, -happiness) |>
+  drop_na()
+
+nrow(cluster_data)
+
+# countries we keep in each region
+gapminder |>
+  filter(!is.na(name)) |>
+  count(world_4region, name = "all_countries") |>
+  left_join(count(cluster_data, world_4region, name = "kept"), by = "world_4region")
+```
+
+The countries we lose aren't spread evenly. We keep 44 of 54 African and 36 of 48 European countries but only 21 of 35 in the Americas and 28 of 57 in Asia, so Asia is the region the clusters know the least about.
 
 ### Will you use categorical variables in your clusters?
 
 Will you use categorical variables in your clusters? If so how will you deal with them and where did you get that information from? If not, why not?
 
+No we're only using the 26 quantitative variables. k-means works with Euclidean distance which is only valid for continuous variables, and a category like `freedom_status` would have to be turned into dummy columns that don't have any real distance between them. The Wicked Good Data post on clustering mixed data makes the same point and says to use Gower distance with PAM if categorical variables are needed. We skip that since `income_level` mostly repeats what `log_daily_income` already says and the other four categorical variables would be a small part of the data anyway.
+
 ### Making clusters
 
 Make your clusters. Tune for how many clusters as part of the process.
+
+We scale every variable first so they all have mean 0 and standard deviation 1, since otherwise `log_gdp` with values around 9 would count for way more than `hdi` with values under 1. Then we try 1 to 10 clusters and look at three checks, the elbow in the total within sum of squares, the average silhouette width, and the gap statistic. We use `nstart = 25` so each k-means run tries 25 random starts and keeps the best one.
+
+```{r}
+#| label: choose-k
+
+cluster_x <- cluster_data |>
+  select(where(is.numeric)) |>
+  scale()
+dist_x <- dist(cluster_x)
+
+set.seed(321)
+k_check <- tibble(k = 1:10) |>
+  mutate(
+    km = map(k, ~ kmeans(cluster_x, centers = .x, nstart = 25)),
+    wss = map_dbl(km, "tot.withinss"),
+    silhouette = map2_dbl(km, k, ~ if (.y == 1) NA_real_ else mean(cluster::silhouette(.x$cluster, dist_x)[, 3])),
+    ari = map_dbl(km, ~ mclust::adjustedRandIndex(.x$cluster, cluster_data$world_4region))
+  )
+
+set.seed(321)
+gap_stat <- cluster::clusGap(cluster_x, FUNcluster = kmeans, K.max = 10, B = 100, nstart = 25)
+cluster::maxSE(gap_stat$Tab[, "gap"], gap_stat$Tab[, "SE.sim"], method = "firstSEmax")
+
+k_check |> select(k, wss, silhouette, ari)
+```
+
+```{r}
+#| label: choose-k-plot
+
+bind_rows(
+  k_check |> transmute(k, method = "Total Within Sum of Squares", value = wss),
+  k_check |> filter(k > 1) |> transmute(k, method = "Average Silhouette Width", value = silhouette),
+  tibble(k = 1:10, method = "Gap Statistic", value = gap_stat$Tab[, "gap"])
+) |>
+  mutate(method = factor(method, levels = c("Total Within Sum of Squares", "Average Silhouette Width", "Gap Statistic"))) |>
+  ggplot(mapping = aes(x = k, y = value)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 3, linetype = "dashed") +
+  scale_x_continuous(breaks = 1:10) +
+  facet_wrap(~ method, scales = "free_y") +
+  labs(title = "Choosing the Number of Clusters",
+       x = "Number of Clusters", y = "Value") +
+  theme_minimal()
+```
+
+The elbow bends at 3 clusters since the total within sum of squares drops from 3328 to 1840 to 1416 and then flattens out, and the gap statistic picks 3 as well with the one standard error rule. The silhouette is the odd one out with its highest value of 0.42 at 2 clusters, but 2 clusters mostly just split Africa off from everyone else with an adjusted Rand index of only 0.21 against `world_4region` so it doesn't tell us much. At 3 clusters the average silhouette is 0.288 and at 4 it's 0.293, which is basically the same, so the extra cluster doesn't buy us anything and we go with 3.
+
+```{r}
+#| label: final-clusters
+
+set.seed(321)
+final_km <- kmeans(cluster_x, centers = 3, nstart = 25)
+
+# kmeans numbers the clusters randomly so we renumber them by life expectancy, cluster 1 is the healthiest
+cluster_labels <- cluster_data |>
+  mutate(raw_cluster = final_km$cluster) |>
+  group_by(raw_cluster) |>
+  summarise(mean_life_exp = mean(life_exp)) |>
+  arrange(desc(mean_life_exp)) |>
+  mutate(cluster = factor(row_number()))
+
+cluster_data <- cluster_data |>
+  mutate(raw_cluster = final_km$cluster) |>
+  left_join(select(cluster_labels, raw_cluster, cluster), by = "raw_cluster") |>
+  select(-raw_cluster)
+
+count(cluster_data, cluster)
+```
 
 ### Cluster quality
 
 Evaluate cluster metrics on your final clusters.
 
+```{r}
+#| label: cluster-quality
+
+sil <- cluster::silhouette(as.integer(cluster_data$cluster), dist_x)
+
+tibble(cluster = cluster_data$cluster, width = sil[, 3]) |>
+  group_by(cluster) |>
+  summarise(countries = n(), avg_silhouette = mean(width), negative = sum(width < 0))
+
+# average silhouette over all countries
+mean(sil[, 3])
+
+# share of the total variation that sits between the clusters
+final_km$betweenss / final_km$totss
+```
+
+The 3 clusters have 41, 53 and 35 countries and the average silhouette is 0.288, which is in the weak range by the usual rule of thumb, so the countries don't fall into three tight separate groups. Cluster 1 is the tightest at 0.41 and cluster 2 the loosest at 0.20 which makes sense since it's the middle group sitting between the other two, and 7 of the 11 countries with a negative silhouette are in it. On the other side the between cluster variation is 57.5% of the total, so the clusters do pick up a lot of the structure even though the edges between them are blurry.
+
 ### Check against hold out categorical variable
 
 Did the clusters match your hold out categorical variable. Make a graph that shows the relationship and discuss.
+
+```{r}
+#| label: cluster-vs-region
+
+table(Cluster = cluster_data$cluster, Region = cluster_data$world_4region)
+
+cluster_data |>
+  ggplot(mapping = aes(x = world_4region, fill = cluster)) +
+  geom_bar(position = "fill") +
+  labs(title = "Share of Each World Region in Each Cluster",
+       x = "World Region", y = "Share of Countries", fill = "Cluster") +
+  theme_minimal()
+
+# 1 is a perfect match and 0 is what random clusters would give
+mclust::adjustedRandIndex(cluster_data$cluster, cluster_data$world_4region)
+
+# countries that don't follow the main pattern
+cluster_data |>
+  filter((world_4region == "europe" & cluster != "1") |
+           (world_4region == "africa" & cluster != "3") |
+           (world_4region %in% c("asia", "americas") & cluster == "1")) |>
+  select(name, world_4region, cluster) |>
+  arrange(world_4region, cluster) |>
+  print(n = Inf)
+```
+
+The clusters match the regions partly. The adjusted Rand index is 0.39 so it's well above 0 but far from 1. Europe and Africa each sit mostly in one cluster, with 32 of 36 European countries in cluster 1 and 32 of 44 African countries in cluster 3, while Asia and the Americas are mostly in cluster 2 with 22 of 28 and 15 of 21, so the clusters can't tell those two regions apart. The countries that break the pattern are mostly easy to explain by wealth, since the 12 African countries in cluster 2 include South Africa, Botswana, Mauritius and Tunisia, the 4 European countries in cluster 2 are Albania, Armenia, North Macedonia and Turkey, and the Asian and American countries in cluster 1 are Japan, Israel, Bahrain, Australia, Canada, the USA, Chile, Uruguay and Barbados. So the clusters follow how developed a country is much more than where it is.
 
 ### PCA
 
 Perform PCA on your quantitative variables.
 
+We run `prcomp()` on the same 26 quantitative variables with `scale. = TRUE`, which is the same scaling we used for the clusters, and then turn the standard deviations into eigenvalues and the share of variance each component explains.
+
+```{r}
+#| label: pca
+
+pca_result <- cluster_data |>
+  select(where(is.numeric)) |>
+  prcomp(scale. = TRUE)
+
+pca_var <- tibble(pc = 1:length(pca_result$sdev), eigenvalue = pca_result$sdev^2) |>
+  mutate(prop = eigenvalue / sum(eigenvalue), cumulative = cumsum(prop))
+
+head(pca_var, 8)
+```
+
 ### Which components?
 
 Which components would you use of your PCA?
+
+```{r}
+#| label: scree-plot
+
+pca_var |>
+  filter(pc <= 10) |>
+  ggplot(mapping = aes(x = pc, y = eigenvalue)) +
+  geom_col() +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_x_continuous(breaks = 1:10) +
+  labs(title = "Scree Plot of the Principal Components",
+       x = "Principal Component", y = "Eigenvalue") +
+  theme_minimal()
+```
+
+The first component is huge with an eigenvalue of 15.4 and 59.4% of the variance, and then it drops to 2.0 for the second and 1.5 for the third, so the elbow is right after PC1. By the rule of keeping eigenvalues above 1 we would keep the first 5 components, which add up to 80.9% of the variance, but components 2 to 5 only add between 4% and 8% each. We use the first two for our graphs since PC1 is the one that matters and PC2 is the next biggest at 7.7%, which puts us at 67.1% of the variance, and if we wanted 80% of it for something like a model we would need all 5.
 
 ### Loading/biplot
 
 Make a loading plot/biplot for the first two components. You may additionally want to make a bar chart of the coefficents. What does this tell you about the PCA components and your variables?
 
+```{r}
+#| label: loading-bars
+
+pca_loadings <- as_tibble(pca_result$rotation[, 1:2], rownames = "variable")
+
+pca_loadings |>
+  pivot_longer(c(PC1, PC2), names_to = "component", values_to = "loading") |>
+  mutate(variable = factor(variable, levels = pca_loadings$variable[order(pca_loadings$PC1)])) |>
+  ggplot(mapping = aes(x = loading, y = variable)) +
+  geom_col() +
+  facet_wrap(~ component) +
+  labs(title = "Loadings of the First Two Principal Components",
+       x = "Loading", y = "Variable") +
+  theme_minimal()
+```
+
+```{r}
+#| label: loading-plot
+
+pca_loadings |>
+  ggplot(mapping = aes(x = PC1, y = PC2)) +
+  geom_segment(mapping = aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.15, "cm"))) +
+  geom_text(mapping = aes(label = variable, hjust = if_else(PC1 < 0, 1.1, -0.1)),
+            size = 2.5, check_overlap = TRUE) +
+  scale_x_continuous(expand = expansion(mult = 0.3)) +
+  labs(title = "Loading Plot for the First Two Components",
+       x = "PC1 Loading", y = "PC2 Loading") +
+  theme_minimal()
+```
+
+PC1 is a development scale. Almost every variable has a loading around 0.2 in size, with `child_per_woman`, `child_mortality`, `maternal_mortality`, `poverty_rate` and `traffic_deaths` pushing it up and `hdi`, `log_gdp`, `life_exp`, `internet`, `basic_sanitation` and `median_age` pushing it down, so a low PC1 score is a rich healthy country and a high one is a poor country. The variables that barely load on PC1 are `log_population`, `inflation`, `labor_force_rate`, `suicide_rate` and `murder_rate`, which means they don't follow development much. PC2 is mostly `suicide_rate` at 0.45, `alcohol_per_person` at 0.43 and `labor_force_rate` at 0.40, with `corruption_index` and `poverty_rate` behind them, and `electricity_access`, `water_access` and `basic_sanitation` pointing the other way, so it's a second axis that isn't really about development.
+
 ### Compare to clusters
 
 Make a graph of your clusters, your hold out category, and the first two components of your PCA. What does this tell you about your clusters?
+
+```{r}
+#| label: pca-clusters
+
+pca_scores <- as_tibble(pca_result$x[, 1:2]) |>
+  bind_cols(select(cluster_data, name, cluster, world_4region))
+
+# a few countries at the edges to label
+edge_names <- c("Central African Republic", "Switzerland", "Iraq", "Lesotho")
+
+pca_scores |>
+  ggplot(mapping = aes(x = PC1, y = PC2, color = cluster, shape = world_4region)) +
+  geom_point(size = 2.5) +
+  geom_text(data = filter(pca_scores, name %in% edge_names),
+            mapping = aes(label = name), size = 3, vjust = -0.8, show.legend = FALSE) +
+  scale_shape_manual(values = c(16, 17, 15, 18)) +
+  scale_x_continuous(expand = expansion(mult = c(0.12, 0.2))) +
+  scale_y_continuous(expand = expansion(mult = 0.1)) +
+  labs(title = "Countries on the First Two Principal Components",
+       x = "PC1", y = "PC2", color = "Cluster", shape = "World Region") +
+  theme_minimal()
+
+pca_scores |>
+  group_by(cluster) |>
+  summarise(mean_PC1 = mean(PC1), mean_PC2 = mean(PC2))
+```
+
+The clusters line up along PC1 in order, with mean scores of -4.15 for cluster 1, -0.39 for cluster 2 and 5.46 for cluster 3, so the three clusters are really three slices of the same development scale and there's no gap in the cloud of points between them. That matches the weak silhouette from before since the middle cluster touches both of the others. PC2 doesn't separate the clusters much except that cluster 2 sits lower, with a mean of -1.20 against 0.95 and 0.71. The shapes show the same thing the bar chart did, with the European triangles on the left, the African points on the right, and Asia and the Americas mixed together in the middle.
 
 ## Your question
 
@@ -197,6 +431,47 @@ Goal: Represent the most interesting parts of the relationship possible. This wi
 ### Other additional EDA (optional)
 
 This is a space for additional EDA that is related to your clustering/PCA or additional question. Make sure to describe your graphs. You may want to compute some statistics as well.
+
+To see what the clusters actually are we look at their averages in the original units, using the geometric mean for gdp since we logged it.
+
+```{r}
+#| label: cluster-profile
+
+cluster_data |>
+  group_by(cluster) |>
+  summarise(
+    countries       = n(),
+    life_exp        = mean(life_exp),
+    child_per_woman = mean(child_per_woman),
+    child_mortality = mean(child_mortality),
+    hdi             = mean(hdi),
+    internet        = mean(internet),
+    typical_gdp     = exp(mean(log_gdp))
+  ) |>
+  knitr::kable(digits = 2, caption = "Average of key variables in each cluster")
+```
+
+Cluster 1 has a life expectancy of 80.4 years, 1.48 children per woman and a typical gdp of about 51,000, cluster 3 has 64.2 years, 4.04 children per woman and about 3,200, and cluster 2 sits in between at 74.5 years, 2.16 children and about 14,800. So we can call them the high, middle and low development clusters, and child mortality shows the biggest gap with 3.9 deaths in cluster 1, 17.0 in cluster 2 and 60.9 in cluster 3.
+
+Since PC2 isn't about development we check it against the variable with the biggest loading that we haven't explained yet.
+
+```{r}
+#| label: pc2-alcohol
+
+pca_scores |>
+  mutate(alcohol_per_person = cluster_data$alcohol_per_person) |>
+  ggplot(mapping = aes(x = alcohol_per_person, y = PC2, color = cluster)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_point(data = ~ filter(.x, name %in% c("Iraq", "Egypt", "Jordan", "Algeria", "Morocco")),
+             shape = 1, size = 5, color = "black") +
+  labs(title = "PC2 Score vs Alcohol Use Per Person",
+       x = "Alcohol Use Per Person", y = "PC2", color = "Cluster") +
+  theme_minimal()
+
+cor(pca_scores$PC2, cluster_data$alcohol_per_person)
+```
+
+The correlation between PC2 and `alcohol_per_person` is 0.61, so alcohol use is a big part of PC2 even though it's one of three. The circled countries at the very bottom of PC2 are Iraq, Egypt, Jordan, Algeria and Morocco, which all drink very little with `alcohol_per_person` at 0.54 or less against a median of about 4.4 across all the countries in the file, and they also have low labor force rates at 40 to 44 against a median of about 62, which is why they all end up low on PC2 while still in the middle development cluster.
 
 ## Conclusions and unanswered questions
 
